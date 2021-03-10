@@ -1,10 +1,14 @@
+use std::collections::BTreeMap;
+use std::convert::TryInto;
+use std::ffi::CStr;
+use std::io::Read;
+use std::str::FromStr;
+
 use byteorder::{LittleEndian, ReadBytesExt};
 use fallible_iterator::FallibleIterator;
 use serde::Serialize;
-use std::convert::{TryFrom, TryInto};
-use std::ffi::CStr;
-use std::io::Read;
 use thiserror::Error;
+use tpmless_tpm2::{DigestAlgorithm, PcrExtender, PcrExtenderBuilder};
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -22,11 +26,15 @@ pub enum Error {
     CStringToString(#[from] std::ffi::IntoStringError),
     #[error("Invalid data encountered")]
     DataError,
+    #[error("Unsupported digest algo {0} encountered")]
+    UnknownDigestAlgo(String),
+    #[error("Error in TPMLess")]
+    Tpmless(#[from] tpmless_tpm2::Error),
 }
 
 #[derive(Debug, Serialize)]
 pub struct Digest {
-    algo: String,
+    algo: DigestAlgorithm,
     #[serde(with = "hex")]
     digest: Vec<u8>,
 }
@@ -95,7 +103,7 @@ fn parse_digest<R: Read>(is_legacy_ima_template: bool, reader: &mut R) -> Result
     let mut buf = zeroed_vec(len as usize);
     reader.read_exact(&mut buf)?;
     let (algo, digest) = if is_legacy_ima_template {
-        (String::from("sha1"), buf)
+        ("sha1", buf)
     } else {
         // The first few bytes until a ':' are the algo
         let split = match buf.iter().position(|&r| r == b':') {
@@ -103,12 +111,12 @@ fn parse_digest<R: Read>(is_legacy_ima_template: bool, reader: &mut R) -> Result
             None => return Err(Error::DataError),
         };
         let (algo, digest) = buf.split_at(split + 2);
-        let algo = std::str::from_utf8(algo)?
-            .trim_end_matches(":\0")
-            .to_owned();
+        let algo = std::str::from_utf8(algo)?.trim_end_matches(":\0");
 
         (algo, digest.to_vec())
     };
+
+    let algo = DigestAlgorithm::from_str(algo)?;
 
     Ok(Digest { algo, digest })
 }
@@ -130,11 +138,7 @@ fn parse_name<R: Read>(is_legacy_ima_template: bool, reader: &mut R) -> Result<S
 }
 
 impl EventData {
-    fn parse<R: Read>(
-        template_name: &str,
-        reader: &mut R,
-        _data_len: usize,
-    ) -> Result<Self, Error> {
+    fn parse<R: Read>(template_name: &str, reader: &mut R) -> Result<Self, Error> {
         match template_name {
             "ima" => {
                 // "d|n"
@@ -200,6 +204,7 @@ pub struct Event {
 #[derive(Debug)]
 pub struct Parser<R: Read> {
     reader: R,
+    pcr_tracker: PcrExtender,
 }
 
 fn zeroed_vec(len: usize) -> Vec<u8> {
@@ -209,7 +214,85 @@ fn zeroed_vec(len: usize) -> Vec<u8> {
 impl<R: Read> Parser<R> {
     pub fn new(reader: R) -> Self {
         // Return a new Parser instance
-        Parser { reader }
+        Parser {
+            reader,
+            pcr_tracker: PcrExtenderBuilder::new()
+                .add_digest_method(DigestAlgorithm::Sha1)
+                .add_digest_method(DigestAlgorithm::Sha256)
+                .add_digest_method(DigestAlgorithm::Sha384)
+                .add_digest_method(DigestAlgorithm::Sha512)
+                .build(),
+        }
+    }
+
+    pub fn pcr_values(self) -> PcrValues {
+        pcr_extender_to_values(self.pcr_tracker)
+    }
+}
+
+pub type PcrValues = BTreeMap<u32, PcrValue>;
+
+fn pcr_extender_to_values(ext: PcrExtender) -> PcrValues {
+    let mut vals = BTreeMap::new();
+
+    for (algo, mut bank) in ext.values().drain() {
+        for (pcr, val) in bank.drain(..).enumerate() {
+            let is_empty = val.iter().all(|v| *v == 0x00);
+            if is_empty {
+                continue;
+            }
+
+            let pcr = pcr as u32;
+
+            let pcr_vals: &mut PcrValue = match vals.get_mut(&pcr) {
+                Some(v) => v,
+                None => {
+                    vals.insert(pcr, Default::default());
+                    vals.get_mut(&pcr).unwrap()
+                }
+            };
+
+            match algo {
+                DigestAlgorithm::Sha1 => {
+                    pcr_vals.sha1 = val.try_into().unwrap();
+                }
+                DigestAlgorithm::Sha256 => {
+                    pcr_vals.sha256 = val.try_into().unwrap();
+                }
+                DigestAlgorithm::Sha384 => {
+                    pcr_vals.sha384 = val.try_into().unwrap();
+                }
+                DigestAlgorithm::Sha512 => {
+                    pcr_vals.sha512 = val.try_into().unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    vals
+}
+
+#[derive(Debug, Serialize)]
+pub struct PcrValue {
+    #[serde(with = "hex")]
+    pub sha1: [u8; 20],
+    #[serde(with = "hex")]
+    pub sha256: [u8; 32],
+    #[serde(with = "hex")]
+    pub sha384: [u8; 48],
+    #[serde(with = "hex")]
+    pub sha512: [u8; 64],
+}
+
+impl Default for PcrValue {
+    fn default() -> Self {
+        PcrValue {
+            sha1: [0; 20],
+            sha256: [0; 32],
+            sha384: [0; 48],
+            sha512: [0; 64],
+        }
     }
 }
 
@@ -240,8 +323,14 @@ impl<R: Read> FallibleIterator for Parser<R> {
 
         // Event data
         let eventdata_len = self.reader.read_u32::<LittleEndian>()?;
-        let eventdata = EventData::parse(&template_name, &mut self.reader, eventdata_len as usize)?;
+        let mut event_data = zeroed_vec(eventdata_len as usize);
+        self.reader.read_exact(&mut event_data)?;
+        let eventdata = EventData::parse(&template_name, &mut event_data.as_slice())?;
 
+        // Extend PCR tracker
+        self.pcr_tracker.extend(pcr_index, &event_data)?;
+
+        // Return
         Ok(Some(Event {
             pcr_index,
             template_sha1,
@@ -252,8 +341,44 @@ impl<R: Read> FallibleIterator for Parser<R> {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::TryFrom;
+    use std::fs::File;
+    use std::path::Path;
+
+    use fallible_iterator::FallibleIterator;
+
+    use crate::{EventData, Parser};
+
     #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+    fn test_ima_ng() {
+        let dirname = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fname = dirname.join("test_assets/imang");
+        let file = File::open(&fname).expect("Test asset not found");
+
+        let mut parser = Parser::new(file);
+
+        while let Some(event) = parser.next().expect("Failed to parse event") {
+            assert_eq!(event.pcr_index, 10);
+            match event.data {
+                EventData::ImaNg { .. } => {}
+                _ => panic!("Invalid event type encountered: {:?}", event),
+            }
+        }
+
+        // Now check PCR values
+        let pcr_values = parser.pcr_values();
+        assert_eq!(pcr_values.len(), 1);
+
+        let pcr_values = pcr_values.get(&10).expect("PCR 10 not measured");
+
+        assert_eq!(
+            Vec::<u8>::try_from(pcr_values.sha1).unwrap(),
+            hex::decode("3BBFF82F30A587E9F6356783230B9CBD9F0D5F64").unwrap(),
+        );
+        assert_eq!(
+            Vec::<u8>::try_from(pcr_values.sha256).unwrap(),
+            hex::decode("5C9E6EDB1C8E04B26852299783ADCD93D5BBB81ED0391021AEFF6618C9F1E142")
+                .unwrap(),
+        );
     }
 }

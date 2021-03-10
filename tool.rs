@@ -1,8 +1,9 @@
 use fallible_iterator::FallibleIterator;
+use serde::Serialize;
 use std::{env, fs::File};
 use thiserror::Error;
 
-use ima_measurements::{Event, Parser};
+use ima_measurements::{Event, Parser, PcrValues};
 
 #[derive(Debug, Error)]
 enum ToolError {
@@ -14,19 +15,29 @@ enum ToolError {
     Yaml(#[from] serde_yaml::Error),
 }
 
-fn main() -> Result<(), ToolError> {
-    pretty_env_logger::init();
+#[derive(Debug, Serialize)]
+struct Results {
+    events: Vec<Event>,
+    pcr_values: PcrValues,
+}
 
+fn main() -> Result<(), ToolError> {
     let mut args = env::args();
     // Ignore our binary name
     args.next();
 
     for filename in args {
         let file = File::open(&filename)?;
-        let parser = Parser::new(file);
-        let events: Vec<Event> = parser.collect()?;
+        let mut parser = Parser::new(file);
+        let mut events: Vec<Event> = Vec::new();
 
-        serde_yaml::to_writer(std::io::stdout(), &events)?;
+        while let Some(event) = parser.next()? {
+            events.push(event);
+        }
+
+        let pcr_values = parser.pcr_values();
+
+        serde_yaml::to_writer(std::io::stdout(), &Results { events, pcr_values })?;
     }
 
     Ok(())
