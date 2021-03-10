@@ -34,9 +34,9 @@ pub enum Error {
 
 #[derive(Debug, Serialize)]
 pub struct Digest {
-    algo: DigestAlgorithm,
+    pub algo: DigestAlgorithm,
     #[serde(with = "hex")]
-    digest: Vec<u8>,
+    pub digest: Vec<u8>,
 }
 
 #[derive(Debug, Serialize)]
